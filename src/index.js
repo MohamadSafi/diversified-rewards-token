@@ -51,17 +51,17 @@ async function main() {
       }
 
       // Step 3: Distribute rewards if there's something to distribute
-      // if (withdrawnAmount > 0n) {
-      //   try {
-      //     await distributeRewards(withdrawAuthority, holders, withdrawnAmount);
-      //     console.log("Distribution completed successfully!");
-      //   } catch (error) {
-      //     console.error("Error distributing rewards:", error);
-      //     // Log and continue, no need to throw
-      //   }
-      // } else {
-      //   console.log("No fees to distribute");
-      // }
+      if (withdrawnAmount > 0n) {
+        try {
+          await distributeRewards(withdrawAuthority, holders, withdrawnAmount);
+          console.log("Distribution completed successfully!");
+        } catch (error) {
+          console.error("Error distributing rewards:", error);
+          // Log and continue, no need to throw
+        }
+      } else {
+        console.log("No fees to distribute");
+      }
     } catch (error) {
       // This catch should be redundant but keeps us extra safe
       console.error("Unexpected error in runDistribution:", error);
