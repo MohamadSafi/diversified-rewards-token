@@ -24,30 +24,14 @@ const {
 
 let currentOutputIndex = 0;
 
-async function sendBatchWithRetry(
-  connection,
-  batchTx,
-  withdrawAuthority,
-  retries = 3
-) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+async function retryOperation(operation, maxRetries = 3, delayMs = 2000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const latestBlockhash = await connection.getLatestBlockhash();
-      batchTx.recentBlockhash = latestBlockhash.blockhash;
-      batchTx.feePayer = withdrawAuthority.publicKey;
-      const signature = await sendAndConfirmTransaction(connection, batchTx, [
-        withdrawAuthority,
-      ]);
-      console.log(
-        `Batch of ${batchTx.instructions.length} transfers sent. TX: ${signature}`
-      );
-      return signature;
-    } catch (err) {
-      if (attempt === retries) {
-        throw err; // After max retries, throw the error
-      }
-      console.log(`Retry ${attempt}/${retries} failed:`, err.message);
-      await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1s before retry
+      return await operation();
+    } catch (error) {
+      console.error(`Attempt ${attempt}/${maxRetries} failed:`, error);
+      if (attempt === maxRetries) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
 }
@@ -62,8 +46,8 @@ async function distributeToHolders(
 ) {
   let batchTx = new Transaction();
   let instructionsCount = 0;
-
   const outputMintPk = new PublicKey(outputMint);
+  let failedHolders = []; // Track holders that fail for retry
 
   for (const holder of holders) {
     try {
@@ -98,12 +82,26 @@ async function distributeToHolders(
           continue;
         }
 
-        const holderAta = await getOrCreateAssociatedTokenAccount(
-          connection,
-          withdrawAuthority,
-          outputMintPk,
-          holderPk
-        );
+        let holderAta;
+        try {
+          holderAta = await retryOperation(() =>
+            getOrCreateAssociatedTokenAccount(
+              connection,
+              withdrawAuthority,
+              outputMintPk,
+              holderPk,
+              false,
+              "confirmed"
+            )
+          );
+        } catch (error) {
+          console.error(
+            `Failed to get/create ATA for ${holder.address} after retries:`,
+            error
+          );
+          failedHolders.push({ holder, share }); // Queue for retry later
+          continue;
+        }
 
         batchTx.add(
           createTransferInstruction(
@@ -119,17 +117,83 @@ async function distributeToHolders(
 
       instructionsCount++;
       if (instructionsCount === BATCH_SIZE) {
-        await sendBatchWithRetry(connection, batchTx, withdrawAuthority);
+        const signature = await retryOperation(() =>
+          sendAndConfirmTransaction(connection, batchTx, [withdrawAuthority])
+        );
+        console.log(
+          `Batch of ${instructionsCount} transfers sent. TX: ${signature}`
+        );
         batchTx = new Transaction();
         instructionsCount = 0;
       }
     } catch (err) {
       console.error(`Error distributing to ${holder.address}:`, err);
+      failedHolders.push({ holder, share });
     }
   }
 
+  // Send final batch if any
   if (batchTx.instructions.length > 0) {
-    await sendBatchWithRetry(connection, batchTx, withdrawAuthority);
+    const signature = await retryOperation(() =>
+      sendAndConfirmTransaction(connection, batchTx, [withdrawAuthority])
+    );
+    console.log(
+      `Final batch of ${batchTx.instructions.length} transfers sent. TX: ${signature}`
+    );
+  }
+
+  // Retry failed holders
+  if (failedHolders.length > 0) {
+    console.log(`Retrying ${failedHolders.length} failed holders...`);
+    for (const { holder, share } of failedHolders) {
+      try {
+        const holderPk = new PublicKey(holder.address);
+        if (isSolOutput) {
+          const tx = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: withdrawAuthority.publicKey,
+              toPubkey: holderPk,
+              lamports: Number(share),
+            })
+          );
+          const signature = await retryOperation(() =>
+            sendAndConfirmTransaction(connection, tx, [withdrawAuthority])
+          );
+          console.log(
+            `Retry for ${holder.address} succeeded. TX: ${signature}`
+          );
+        } else {
+          const holderAta = await retryOperation(() =>
+            getOrCreateAssociatedTokenAccount(
+              connection,
+              withdrawAuthority,
+              outputMintPk,
+              holderPk,
+              false,
+              "confirmed"
+            )
+          );
+          const tx = new Transaction().add(
+            createTransferInstruction(
+              sourceAtaPubkey,
+              holderAta.address,
+              withdrawAuthority.publicKey,
+              Number(share),
+              [],
+              TOKEN_PROGRAM_ID
+            )
+          );
+          const signature = await retryOperation(() =>
+            sendAndConfirmTransaction(connection, tx, [withdrawAuthority])
+          );
+          console.log(
+            `Retry for ${holder.address} succeeded. TX: ${signature}`
+          );
+        }
+      } catch (err) {
+        console.error(`Retry failed for ${holder.address}:`, err);
+      }
+    }
   }
 }
 
@@ -139,41 +203,73 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
   const isSolOutput = isNativeSol(outputMint);
   const outputMintPk = new PublicKey(outputMint);
 
-  let beforeAmount = isSolOutput
-    ? BigInt(await connection.getBalance(withdrawAuthority.publicKey))
-    : (
-        await getSplBalance(
-          outputMintPk,
-          withdrawAuthority.publicKey,
-          withdrawAuthority
-        )
-      ).amount;
+  let beforeAmount = 0n;
+  let sourceAtaPubkey = null;
 
+  if (isSolOutput) {
+    beforeAmount = BigInt(
+      await connection.getBalance(withdrawAuthority.publicKey)
+    );
+  } else {
+    try {
+      const { ataPubkey, amount } = await getSplBalance(
+        outputMintPk,
+        withdrawAuthority.publicKey,
+        withdrawAuthority
+      );
+      sourceAtaPubkey = ataPubkey;
+      beforeAmount = amount;
+    } catch (error) {
+      console.error(
+        "Error getting withdrawAuthority ATA balance, creating ATA:",
+        error
+      );
+      const ata = await getOrCreateAssociatedTokenAccount(
+        connection,
+        withdrawAuthority,
+        outputMintPk,
+        withdrawAuthority.publicKey,
+        false,
+        "confirmed"
+      );
+      sourceAtaPubkey = ata.address;
+      beforeAmount = 0n; // Assume 0 if it didn’t exist before
+    }
+  }
+
+  console.log(`Initiating swap to ${outputMint}...`);
   await performJupiterSwap(
     withdrawAuthority,
     MINT_ADDRESS.toBase58(),
     outputMint,
     withdrawnAmount,
-    isSolOutput
+    isSolOutput,
+    3
   );
 
-  let afterAmount = isSolOutput
-    ? BigInt(await connection.getBalance(withdrawAuthority.publicKey))
-    : (
-        await getSplBalance(
-          outputMintPk,
-          withdrawAuthority.publicKey,
-          withdrawAuthority
-        )
-      ).amount;
+  let afterAmount = 0n;
+  if (isSolOutput) {
+    afterAmount = BigInt(
+      await connection.getBalance(withdrawAuthority.publicKey)
+    );
+  } else {
+    const { amount } = await getSplBalance(
+      outputMintPk,
+      withdrawAuthority.publicKey,
+      withdrawAuthority
+    );
+    afterAmount = amount;
+  }
 
   const tokensReceived = afterAmount - beforeAmount;
   if (tokensReceived <= 0n) throw new Error("Swap failed - no tokens received");
+  console.log(`Received ${tokensReceived} of mint ${outputMint}`);
 
   const toDistribute = (tokensReceived * 4n) / 5n; // 80%
-  const toTreasury = (tokensReceived * 5n) / 100n;
+  const toTreasury = tokensReceived - toDistribute; // 20%
 
   if (toTreasury > 0n) {
+    console.log(`Sending ${toTreasury} to treasury...`);
     if (isSolOutput) {
       const treasuryTx = new Transaction().add(
         SystemProgram.transfer({
@@ -209,18 +305,12 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
       const tx = new Transaction().add(transferIx);
       await sendAndConfirmTransaction(connection, tx, [withdrawAuthority]);
     }
+    console.log("20% sent to treasury.");
   }
 
-  const sourceAtaPubkey = !isSolOutput
-    ? (
-        await getSplBalance(
-          outputMintPk,
-          withdrawAuthority.publicKey,
-          withdrawAuthority
-        )
-      ).ataPubkey
-    : null;
-
+  console.log(
+    `Distributing ${toDistribute} of mint ${outputMint} to holders...`
+  );
   await distributeToHolders(
     withdrawAuthority,
     holders,

@@ -29,6 +29,18 @@ async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
   }
 }
 
+async function retryOperation(operation, maxRetries = 3, delayMs = 2000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.error(`Attempt ${attempt}/${maxRetries} failed:`, error);
+      if (attempt === maxRetries) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function getTokenHolders() {
   let allHolders = [];
   let cursor = null;
@@ -92,9 +104,10 @@ async function withdrawFees(withdrawAuthority) {
     const initialAmount = BigInt(initialBalance.value.amount);
 
     const holders = await getTokenHolders();
+    console.log(`Found ${holders.length} token accounts from Helius API`);
     const tokenAccounts = holders.map((h) => new PublicKey(h.tokenAccount));
 
-    const BATCH_SIZE = 20; // Adjust based on testing; 20 is conservative
+    const BATCH_SIZE = 20;
     const batches = [];
     for (let i = 0; i < tokenAccounts.length; i += BATCH_SIZE) {
       batches.push(tokenAccounts.slice(i, i + BATCH_SIZE));
@@ -103,31 +116,38 @@ async function withdrawFees(withdrawAuthority) {
     console.log(
       `Harvesting from ${tokenAccounts.length} token accounts in ${batches.length} batches...`
     );
-
     const harvestSignatures = [];
     for (const batch of batches) {
-      const signature = await harvestWithheldTokensToMint(
-        connection,
-        withdrawAuthority,
-        MINT_ADDRESS,
-        batch,
-        { commitment: "confirmed" },
-        TOKEN_2022_PROGRAM_ID
+      const signature = await retryOperation(
+        async () => {
+          return await harvestWithheldTokensToMint(
+            connection,
+            withdrawAuthority,
+            MINT_ADDRESS,
+            batch,
+            { commitment: "confirmed" },
+            TOKEN_2022_PROGRAM_ID
+          );
+        },
+        3,
+        2000
       );
       harvestSignatures.push(signature);
       console.log(`Harvest batch completed. Signature: ${signature}`);
     }
 
     console.log("Withdrawing withheld tokens from the mint...");
-    const withdrawSignature = await withdrawWithheldTokensFromMint(
-      connection,
-      withdrawAuthority,
-      MINT_ADDRESS,
-      destinationTokenAccount.address,
-      withdrawAuthority.publicKey,
-      [],
-      { commitment: "confirmed" },
-      TOKEN_2022_PROGRAM_ID
+    const withdrawSignature = await retryOperation(() =>
+      withdrawWithheldTokensFromMint(
+        connection,
+        withdrawAuthority,
+        MINT_ADDRESS,
+        destinationTokenAccount.address,
+        withdrawAuthority.publicKey,
+        [],
+        { commitment: "confirmed" },
+        TOKEN_2022_PROGRAM_ID
+      )
     );
     console.log("Withdrawal transaction signature:", withdrawSignature);
 
