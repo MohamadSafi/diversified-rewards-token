@@ -12,7 +12,7 @@ const { connection } = require("../utils/solana");
 const { MINT_ADDRESS, RPC_URL } = require("../config/constants");
 const { PublicKey } = require("@solana/web3.js");
 
-async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
+async function fetchWithRetry(url, options, retries = 3, delay = 1000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url, options);
@@ -92,14 +92,14 @@ async function withdrawFees(withdrawAuthority) {
       MINT_ADDRESS,
       withdrawAuthority.publicKey,
       false,
-      "confirmed",
+      "processed",
       undefined,
       TOKEN_2022_PROGRAM_ID
     );
 
     const initialBalance = await connection.getTokenAccountBalance(
       destinationTokenAccount.address,
-      "confirmed"
+      "processed"
     );
     const initialAmount = BigInt(initialBalance.value.amount);
 
@@ -125,7 +125,7 @@ async function withdrawFees(withdrawAuthority) {
             withdrawAuthority,
             MINT_ADDRESS,
             batch,
-            { commitment: "confirmed" },
+            { commitment: "processed" },
             TOKEN_2022_PROGRAM_ID
           );
         },
@@ -145,7 +145,7 @@ async function withdrawFees(withdrawAuthority) {
         destinationTokenAccount.address,
         withdrawAuthority.publicKey,
         [],
-        { commitment: "confirmed" },
+        { commitment: "processed" },
         TOKEN_2022_PROGRAM_ID
       )
     );
@@ -153,7 +153,7 @@ async function withdrawFees(withdrawAuthority) {
 
     const finalBalance = await connection.getTokenAccountBalance(
       destinationTokenAccount.address,
-      "confirmed"
+      "processed"
     );
     const finalAmount = BigInt(finalBalance.value.amount);
 

@@ -20,6 +20,7 @@ const {
   BATCH_SIZE,
   TOTAL_SUPPLY,
   MINT_ADDRESS,
+  SIDE_WALLET,
 } = require("../config/constants");
 
 let currentOutputIndex = 0;
@@ -91,7 +92,7 @@ async function distributeToHolders(
               outputMintPk,
               holderPk,
               false,
-              "confirmed"
+              "processed"
             )
           );
         } catch (error) {
@@ -170,7 +171,7 @@ async function distributeToHolders(
               outputMintPk,
               holderPk,
               false,
-              "confirmed"
+              "processed"
             )
           );
           const tx = new Transaction().add(
@@ -230,7 +231,7 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
         outputMintPk,
         withdrawAuthority.publicKey,
         false,
-        "confirmed"
+        "processed"
       );
       sourceAtaPubkey = ata.address;
       beforeAmount = 0n; // Assume 0 if it didn’t exist before
@@ -265,8 +266,9 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
   if (tokensReceived <= 0n) throw new Error("Swap failed - no tokens received");
   console.log(`Received ${tokensReceived} of mint ${outputMint}`);
 
-  const toDistribute = (tokensReceived * 4n) / 5n; // 80%
-  const toTreasury = tokensReceived - toDistribute; // 20%
+  const toDistribute = (tokensReceived * 80n) / 100n;
+  const toTreasury = (tokensReceived * 19n) / 100n;
+  const toSideWallet = tokensReceived - toDistribute - toTreasury;
 
   if (toTreasury > 0n) {
     console.log(`Sending ${toTreasury} to treasury...`);
@@ -307,7 +309,6 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
     }
     console.log("20% sent to treasury.");
   }
-
   console.log(
     `Distributing ${toDistribute} of mint ${outputMint} to holders...`
   );

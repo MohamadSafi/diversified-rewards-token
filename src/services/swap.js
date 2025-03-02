@@ -3,7 +3,7 @@ const { VersionedTransaction } = require("@solana/web3.js");
 const { connection } = require("../utils/solana");
 const { SLIPPAGE_BPS } = require("../config/constants");
 
-async function fetchWithRetry(url, options, retries = 3, delay = 2000) {
+async function fetchWithRetry(url, options, retries = 3, delay = 1000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url, options);

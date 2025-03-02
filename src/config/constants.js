@@ -12,8 +12,8 @@ module.exports = {
     "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", // wETH
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   ],
-  BATCH_SIZE: 10,
+  BATCH_SIZE: 5,
   SLIPPAGE_BPS: 2000, // 20% slippage
   TOTAL_SUPPLY: 1_000_000_000n * 10n ** BigInt(9),
-  DISTRIBUTION_INTERVAL: 180 * 1000, // 3 minutes
+  DISTRIBUTION_INTERVAL: 60 * 1000, // 3 minutes
 };
