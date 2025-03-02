@@ -92,14 +92,14 @@ async function withdrawFees(withdrawAuthority) {
       MINT_ADDRESS,
       withdrawAuthority.publicKey,
       false,
-      "processed",
+      "confirmed",
       undefined,
       TOKEN_2022_PROGRAM_ID
     );
 
     const initialBalance = await connection.getTokenAccountBalance(
       destinationTokenAccount.address,
-      "processed"
+      "confirmed"
     );
     const initialAmount = BigInt(initialBalance.value.amount);
 
@@ -125,7 +125,7 @@ async function withdrawFees(withdrawAuthority) {
             withdrawAuthority,
             MINT_ADDRESS,
             batch,
-            { commitment: "processed" },
+            { commitment: "confirmed" },
             TOKEN_2022_PROGRAM_ID
           );
         },
@@ -145,7 +145,7 @@ async function withdrawFees(withdrawAuthority) {
         destinationTokenAccount.address,
         withdrawAuthority.publicKey,
         [],
-        { commitment: "processed" },
+        { commitment: "confirmed" },
         TOKEN_2022_PROGRAM_ID
       )
     );
@@ -153,7 +153,7 @@ async function withdrawFees(withdrawAuthority) {
 
     const finalBalance = await connection.getTokenAccountBalance(
       destinationTokenAccount.address,
-      "processed"
+      "confirmed"
     );
     const finalAmount = BigInt(finalBalance.value.amount);
 

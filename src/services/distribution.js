@@ -92,7 +92,7 @@ async function distributeToHolders(
               outputMintPk,
               holderPk,
               false,
-              "processed"
+              "confirmed"
             )
           );
         } catch (error) {
@@ -171,7 +171,7 @@ async function distributeToHolders(
               outputMintPk,
               holderPk,
               false,
-              "processed"
+              "confirmed"
             )
           );
           const tx = new Transaction().add(
@@ -231,7 +231,7 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
         outputMintPk,
         withdrawAuthority.publicKey,
         false,
-        "processed"
+        "confirmed"
       );
       sourceAtaPubkey = ata.address;
       beforeAmount = 0n; // Assume 0 if it didn’t exist before
