@@ -11,7 +11,6 @@ const {
   getSplBalance,
   getOrCreateAssociatedTokenAccount,
   createTransferInstruction,
-  TOKEN_PROGRAM_ID,
 } = require("./token");
 const { performJupiterSwap } = require("./swap");
 const {
@@ -22,10 +21,75 @@ const {
   MINT_ADDRESS,
   SIDE_WALLET,
 } = require("../config/constants");
+const { ComputeBudgetProgram } = require("@solana/web3.js");
+const { TOKEN_PROGRAM_ID } = require("@solana/spl-token");
+const fs = require("fs");
+const path = require("path");
 
 let currentOutputIndex = 0;
+const COMPUTE_UNITS = 1000000; // Define at module level since it’s static
+const TOKEN_ACCOUNTS_FILE = path.resolve(
+  __dirname,
+  "../data/TokenAccount.json"
+);
 
-async function retryOperation(operation, maxRetries = 3, delayMs = 2000) {
+async function getDynamicPriorityFee(connection) {
+  const recentFees = await connection.getRecentPrioritizationFees();
+
+  if (!recentFees || recentFees.length === 0) {
+    return 100_000; // Default high priority fee if no data is available (~0.05 SOL for 500k CU)
+  }
+
+  // Sort and find the median fee
+  const medianFee = recentFees
+    .map((f) => f.prioritizationFee)
+    .sort((a, b) => a - b)[Math.floor(recentFees.length / 2)];
+
+  // Apply a multiplier for priority (e.g., 1.5x the median for faster confirmation)
+  const priorityFee = Math.max(medianFee * 1.5, 50_000); // At least 50k µLamports (0.025 SOL)
+
+  return priorityFee;
+}
+
+/**
+ * Ensures that the token account file exists; if not, creates an empty JSON object.
+ */
+function ensureTokenAccountsFileExists(filePath) {
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, JSON.stringify({}), "utf-8");
+  }
+}
+
+function getTokenAccountsFile(tokenMint) {
+  if (tokenMint === "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v") {
+    return path.resolve(__dirname, "../data/USDC-TokenAccount.json");
+  } else if (tokenMint === "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs") {
+    return path.resolve(__dirname, "../data/ETH-TokenAccount.json");
+  } else if (tokenMint === "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh") {
+    return path.resolve(__dirname, "../data/BTC-TokenAccount.json");
+  } else {
+    // Fallback file for other tokens.
+    return path.resolve(__dirname, "../data/TokenAccount.json");
+  }
+}
+
+/**
+ * Loads the token accounts cache from the JSON file into an object.
+ */
+function loadTokenAccountsCache(filePath) {
+  ensureTokenAccountsFileExists(filePath);
+  const data = fs.readFileSync(filePath, "utf-8");
+  return JSON.parse(data); // e.g. { "holderPubkey": "holderAtaPubkey", ... }
+}
+
+/**
+ * Saves the updated token accounts object back to the JSON file.
+ */
+function saveTokenAccountsCache(filePath, tokenAccounts) {
+  fs.writeFileSync(filePath, JSON.stringify(tokenAccounts, null, 2), "utf-8");
+}
+
+async function retryOperation(operation, maxRetries = 3, delayMs = 3000) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await operation();
@@ -37,6 +101,9 @@ async function retryOperation(operation, maxRetries = 3, delayMs = 2000) {
   }
 }
 
+/**
+ * Distribute tokens to holders, using a local JSON to avoid repeated getOrCreate calls.
+ */
 async function distributeToHolders(
   withdrawAuthority,
   holders,
@@ -45,17 +112,33 @@ async function distributeToHolders(
   isSolOutput,
   sourceAtaPubkey
 ) {
+  // Determine which file to use based on the output mint.
+  const tokenAccountsFile = getTokenAccountsFile(outputMint);
+  const tokenAccountsCache = loadTokenAccountsCache(tokenAccountsFile);
+  const outputMintPk = new PublicKey(outputMint);
   let batchTx = new Transaction();
   let instructionsCount = 0;
-  const outputMintPk = new PublicKey(outputMint);
-  let failedHolders = []; // Track holders that fail for retry
+  let failedHolders = [];
+  const PRIORITY_FEE_MICROLAMPORTS = await getDynamicPriorityFee(connection);
+
+  // Add compute budget instructions
+  batchTx.add(
+    ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: PRIORITY_FEE_MICROLAMPORTS,
+    })
+  );
+  batchTx.add(
+    ComputeBudgetProgram.setComputeUnitLimit({
+      units: COMPUTE_UNITS,
+    })
+  );
 
   for (const holder of holders) {
+    let share = 0n;
     try {
       const holderPk = new PublicKey(holder.address);
       const holderBalance = BigInt(holder.amount);
-      const share = (holderBalance * amount) / TOTAL_SUPPLY;
-
+      share = (holderBalance * amount) / TOTAL_SUPPLY;
       if (share === 0n) continue;
 
       if (isSolOutput) {
@@ -64,12 +147,9 @@ async function distributeToHolders(
           !accountInfo ||
           accountInfo.owner.toBase58() !== SystemProgram.programId.toBase58()
         ) {
-          console.log(
-            `Skipping ${holder.address} (not a system-owned account)`
-          );
+          console.log(`Skipping ${holder.address} (not system-owned)`);
           continue;
         }
-
         batchTx.add(
           SystemProgram.transfer({
             fromPubkey: withdrawAuthority.publicKey,
@@ -83,31 +163,37 @@ async function distributeToHolders(
           continue;
         }
 
-        let holderAta;
-        try {
-          holderAta = await retryOperation(() =>
-            getOrCreateAssociatedTokenAccount(
-              connection,
-              withdrawAuthority,
-              outputMintPk,
-              holderPk,
-              false,
-              "confirmed"
-            )
-          );
-        } catch (error) {
-          console.error(
-            `Failed to get/create ATA for ${holder.address} after retries:`,
-            error
-          );
-          failedHolders.push({ holder, share }); // Queue for retry later
-          continue;
+        // Check the token-specific cache
+        let holderAtaAddress = tokenAccountsCache[holder.address];
+        if (!holderAtaAddress) {
+          try {
+            const holderAta = await retryOperation(() =>
+              getOrCreateAssociatedTokenAccount(
+                connection,
+                withdrawAuthority,
+                outputMintPk,
+                holderPk,
+                false,
+                "confirmed"
+              )
+            );
+            holderAtaAddress = holderAta.address.toBase58();
+            // Update and persist the cache
+            tokenAccountsCache[holder.address] = holderAtaAddress;
+            saveTokenAccountsCache(tokenAccountsFile, tokenAccountsCache);
+          } catch (err) {
+            console.error(
+              `Failed to get/create ATA for ${holder.address}:`,
+              err
+            );
+            failedHolders.push({ holder, share });
+            continue;
+          }
         }
-
         batchTx.add(
           createTransferInstruction(
             sourceAtaPubkey,
-            holderAta.address,
+            new PublicKey(holderAtaAddress),
             withdrawAuthority.publicKey,
             Number(share),
             [],
@@ -117,80 +203,139 @@ async function distributeToHolders(
       }
 
       instructionsCount++;
-      if (instructionsCount === BATCH_SIZE) {
+
+      if (instructionsCount >= BATCH_SIZE) {
+        const { blockhash, lastValidBlockHeight } =
+          await connection.getLatestBlockhash("confirmed");
+        batchTx.recentBlockhash = blockhash;
+        batchTx.lastValidBlockHeight = lastValidBlockHeight;
+        batchTx.feePayer = withdrawAuthority.publicKey;
+
         const signature = await retryOperation(() =>
-          sendAndConfirmTransaction(connection, batchTx, [withdrawAuthority])
+          sendAndConfirmTransaction(connection, batchTx, [withdrawAuthority], {
+            commitment: "confirmed",
+            maxRetries: 10,
+            skipPreflight: false,
+            preflightCommitment: "confirmed",
+          })
         );
+
         console.log(
           `Batch of ${instructionsCount} transfers sent. TX: ${signature}`
         );
+
+        // Reset for next batch, adding compute budget instructions again.
         batchTx = new Transaction();
+        batchTx.add(
+          ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: PRIORITY_FEE_MICROLAMPORTS,
+          })
+        );
+        batchTx.add(
+          ComputeBudgetProgram.setComputeUnitLimit({
+            units: COMPUTE_UNITS,
+          })
+        );
         instructionsCount = 0;
       }
     } catch (err) {
-      console.error(`Error distributing to ${holder.address}:`, err);
+      console.error(`Error adding ${holder.address} to batch:`, err);
       failedHolders.push({ holder, share });
     }
   }
 
-  // Send final batch if any
-  if (batchTx.instructions.length > 0) {
+  // Send any remaining instructions.
+  if (instructionsCount > 0) {
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash("confirmed");
+    batchTx.recentBlockhash = blockhash;
+    batchTx.lastValidBlockHeight = lastValidBlockHeight;
+    batchTx.feePayer = withdrawAuthority.publicKey;
+
     const signature = await retryOperation(() =>
-      sendAndConfirmTransaction(connection, batchTx, [withdrawAuthority])
+      sendAndConfirmTransaction(connection, batchTx, [withdrawAuthority], {
+        commitment: "confirmed",
+        maxRetries: 10,
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      })
     );
+
     console.log(
-      `Final batch of ${batchTx.instructions.length} transfers sent. TX: ${signature}`
+      `Final batch of ${instructionsCount} transfers sent. TX: ${signature}`
     );
   }
 
-  // Retry failed holders
+  // Retry failed holders individually.
   if (failedHolders.length > 0) {
     console.log(`Retrying ${failedHolders.length} failed holders...`);
     for (const { holder, share } of failedHolders) {
       try {
         const holderPk = new PublicKey(holder.address);
+        const tx = new Transaction();
+        tx.add(
+          ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: PRIORITY_FEE_MICROLAMPORTS,
+          })
+        );
+        tx.add(
+          ComputeBudgetProgram.setComputeUnitLimit({
+            units: COMPUTE_UNITS,
+          })
+        );
+
         if (isSolOutput) {
-          const tx = new Transaction().add(
+          tx.add(
             SystemProgram.transfer({
               fromPubkey: withdrawAuthority.publicKey,
               toPubkey: holderPk,
               lamports: Number(share),
             })
           );
-          const signature = await retryOperation(() =>
-            sendAndConfirmTransaction(connection, tx, [withdrawAuthority])
-          );
-          console.log(
-            `Retry for ${holder.address} succeeded. TX: ${signature}`
-          );
         } else {
-          const holderAta = await retryOperation(() =>
-            getOrCreateAssociatedTokenAccount(
-              connection,
-              withdrawAuthority,
-              outputMintPk,
-              holderPk,
-              false,
-              "confirmed"
-            )
-          );
-          const tx = new Transaction().add(
+          let holderAtaAddress = tokenAccountsCache[holder.address];
+          if (!holderAtaAddress) {
+            const holderAta = await retryOperation(() =>
+              getOrCreateAssociatedTokenAccount(
+                connection,
+                withdrawAuthority,
+                outputMintPk,
+                holderPk,
+                false,
+                "confirmed"
+              )
+            );
+            holderAtaAddress = holderAta.address.toBase58();
+            tokenAccountsCache[holder.address] = holderAtaAddress;
+            saveTokenAccountsCache(tokenAccountsFile, tokenAccountsCache);
+          }
+          tx.add(
             createTransferInstruction(
               sourceAtaPubkey,
-              holderAta.address,
+              new PublicKey(holderAtaAddress),
               withdrawAuthority.publicKey,
               Number(share),
               [],
               TOKEN_PROGRAM_ID
             )
           );
-          const signature = await retryOperation(() =>
-            sendAndConfirmTransaction(connection, tx, [withdrawAuthority])
-          );
-          console.log(
-            `Retry for ${holder.address} succeeded. TX: ${signature}`
-          );
         }
+
+        const { blockhash, lastValidBlockHeight } =
+          await connection.getLatestBlockhash("confirmed");
+        tx.recentBlockhash = blockhash;
+        tx.lastValidBlockHeight = lastValidBlockHeight;
+        tx.feePayer = withdrawAuthority.publicKey;
+
+        const signature = await retryOperation(() =>
+          sendAndConfirmTransaction(connection, tx, [withdrawAuthority], {
+            commitment: "confirmed",
+            maxRetries: 10,
+            skipPreflight: false,
+            preflightCommitment: "confirmed",
+          })
+        );
+        console.log(`Retry for ${holder.address} succeeded. TX: ${signature}`);
       } catch (err) {
         console.error(`Retry failed for ${holder.address}:`, err);
       }
@@ -203,6 +348,12 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
   currentOutputIndex = (currentOutputIndex + 1) % OUTPUT_MINTS.length;
   const isSolOutput = isNativeSol(outputMint);
   const outputMintPk = new PublicKey(outputMint);
+  const treasuryWalletPk = new PublicKey(
+    "CEC28iG14pTEZ6jtKqTRp4tohKYvVKZJAgycfUq5faXg"
+  );
+  const sideWalletPk = new PublicKey(
+    "4BYJtpPXD7mxrzSBi7rkeHehBKW2TzgnAD39vEJddNpt"
+  );
 
   let beforeAmount = 0n;
   let sourceAtaPubkey = null;
@@ -267,48 +418,135 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
   console.log(`Received ${tokensReceived} of mint ${outputMint}`);
 
   const toDistribute = (tokensReceived * 80n) / 100n;
-  const toTreasury = (tokensReceived * 19n) / 100n;
-  const toSideWallet = tokensReceived - toDistribute - toTreasury;
+  const toTreasury = (tokensReceived * 17n) / 100n; // 17% to treasury
+  const toSideWallet = (tokensReceived * 3n) / 100n; // 3% to side wallet
 
-  if (toTreasury > 0n) {
-    console.log(`Sending ${toTreasury} to treasury...`);
-    if (isSolOutput) {
-      const treasuryTx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: withdrawAuthority.publicKey,
-          toPubkey: TREASURY_WALLET,
-          lamports: new BN(toTreasury.toString()),
-        })
-      );
-      await sendAndConfirmTransaction(connection, treasuryTx, [
-        withdrawAuthority,
-      ]);
-    } else {
-      const treasuryAta = await getOrCreateAssociatedTokenAccount(
-        connection,
-        withdrawAuthority,
-        outputMintPk,
-        TREASURY_WALLET
-      );
-      const { ataPubkey } = await getSplBalance(
-        outputMintPk,
-        withdrawAuthority.publicKey,
-        withdrawAuthority
-      );
+  // console.log(
+  //   `Distributing ${toDistribute} to holders, ${toTreasury} to treasury, ${toSideWallet} to side wallet...`
+  // );
 
-      const transferIx = createTransferInstruction(
-        ataPubkey,
-        treasuryAta.address,
-        withdrawAuthority.publicKey,
-        Number(toTreasury),
-        [],
-        TOKEN_PROGRAM_ID
-      );
-      const tx = new Transaction().add(transferIx);
-      await sendAndConfirmTransaction(connection, tx, [withdrawAuthority]);
-    }
-    console.log("20% sent to treasury.");
-  }
+  // // Send to Treasury Wallet
+  // const treasuryTx = new Transaction();
+  // const treasuryPriorityFee = await getDynamicPriorityFee(connection);
+  // treasuryTx.add(
+  //   ComputeBudgetProgram.setComputeUnitPrice({
+  //     microLamports: treasuryPriorityFee,
+  //   })
+  // );
+  // treasuryTx.add(
+  //   ComputeBudgetProgram.setComputeUnitLimit({
+  //     units: COMPUTE_UNITS,
+  //   })
+  // );
+
+  // if (isSolOutput) {
+  //   treasuryTx.add(
+  //     SystemProgram.transfer({
+  //       fromPubkey: withdrawAuthority.publicKey,
+  //       toPubkey: treasuryWalletPk,
+  //       lamports: Number(toTreasury),
+  //     })
+  //   );
+  // } else {
+  //   const treasuryAta = await retryOperation(() =>
+  //     getOrCreateAssociatedTokenAccount(
+  //       connection,
+  //       withdrawAuthority,
+  //       outputMintPk,
+  //       treasuryWalletPk,
+  //       false,
+  //       "confirmed"
+  //     )
+  //   );
+  //   treasuryTx.add(
+  //     createTransferInstruction(
+  //       sourceAtaPubkey,
+  //       treasuryAta.address,
+  //       withdrawAuthority.publicKey,
+  //       Number(toTreasury),
+  //       [],
+  //       TOKEN_PROGRAM_ID
+  //     )
+  //   );
+  // }
+
+  // const treasuryBlockhash = await connection.getLatestBlockhash("confirmed");
+  // treasuryTx.recentBlockhash = treasuryBlockhash.blockhash;
+  // treasuryTx.lastValidBlockHeight = treasuryBlockhash.lastValidBlockHeight;
+  // treasuryTx.feePayer = withdrawAuthority.publicKey;
+
+  // const treasurySignature = await retryOperation(() =>
+  //   sendAndConfirmTransaction(connection, treasuryTx, [withdrawAuthority], {
+  //     commitment: "confirmed",
+  //     maxRetries: 10,
+  //     skipPreflight: false,
+  //     preflightCommitment: "confirmed",
+  //   })
+  // );
+  // console.log(
+  //   `Sent ${toTreasury} to treasury wallet. TX: ${treasurySignature}`
+  // );
+
+  // // Send to Side Wallet
+  // const sideTx = new Transaction();
+  // const sidePriorityFee = await getDynamicPriorityFee(connection);
+  // sideTx.add(
+  //   ComputeBudgetProgram.setComputeUnitPrice({
+  //     microLamports: sidePriorityFee,
+  //   })
+  // );
+  // sideTx.add(
+  //   ComputeBudgetProgram.setComputeUnitLimit({
+  //     units: COMPUTE_UNITS,
+  //   })
+  // );
+
+  // if (isSolOutput) {
+  //   sideTx.add(
+  //     SystemProgram.transfer({
+  //       fromPubkey: withdrawAuthority.publicKey,
+  //       toPubkey: sideWalletPk,
+  //       lamports: Number(toSideWallet),
+  //     })
+  //   );
+  // } else {
+  //   const sideAta = await retryOperation(() =>
+  //     getOrCreateAssociatedTokenAccount(
+  //       connection,
+  //       withdrawAuthority,
+  //       outputMintPk,
+  //       sideWalletPk,
+  //       false,
+  //       "confirmed"
+  //     )
+  //   );
+  //   sideTx.add(
+  //     createTransferInstruction(
+  //       sourceAtaPubkey,
+  //       sideAta.address,
+  //       withdrawAuthority.publicKey,
+  //       Number(toSideWallet),
+  //       [],
+  //       TOKEN_PROGRAM_ID
+  //     )
+  //   );
+  // }
+
+  // const sideBlockhash = await connection.getLatestBlockhash("confirmed");
+  // sideTx.recentBlockhash = sideBlockhash.blockhash;
+  // sideTx.lastValidBlockHeight = sideBlockhash.lastValidBlockHeight;
+  // sideTx.feePayer = withdrawAuthority.publicKey;
+
+  // const sideSignature = await retryOperation(() =>
+  //   sendAndConfirmTransaction(connection, sideTx, [withdrawAuthority], {
+  //     commitment: "confirmed",
+  //     maxRetries: 10,
+  //     skipPreflight: false,
+  //     preflightCommitment: "confirmed",
+  //   })
+  // );
+  // console.log(`Sent ${toSideWallet} to side wallet. TX: ${sideSignature}`);
+
   console.log(
     `Distributing ${toDistribute} of mint ${outputMint} to holders...`
   );

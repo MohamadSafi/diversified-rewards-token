@@ -1,6 +1,6 @@
 const {
-  harvestWithheldTokensToMint,
-  withdrawWithheldTokensFromMint,
+  createHarvestWithheldTokensToMintInstruction,
+  createWithdrawWithheldTokensFromMintInstruction,
   getOrCreateAssociatedTokenAccount,
   getMint,
   TOKEN_2022_PROGRAM_ID,
@@ -8,16 +8,27 @@ const {
   createTransferInstruction,
 } = require("@solana/spl-token");
 const fetch = require("node-fetch");
-const { connection } = require("../utils/solana");
+const {
+  connection,
+  PublicKey,
+  Transaction,
+  sendAndConfirmTransaction,
+} = require("../utils/solana");
+const { ComputeBudgetProgram } = require("@solana/web3.js");
 const { MINT_ADDRESS, RPC_URL } = require("../config/constants");
-const { PublicKey } = require("@solana/web3.js");
 
-async function fetchWithRetry(url, options, retries = 3, delay = 1000) {
+const COMPUTE_UNITS = 500000;
+
+async function fetchWithRetry(url, options, retries = 5, delay = 1000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url, options);
-      if (!response.ok)
-        throw new Error(`HTTP error! status: ${response.status}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `HTTP error! status: ${response.status}, body: ${errorText}`
+        );
+      }
       return response;
     } catch (error) {
       if (attempt === retries) throw error;
@@ -29,7 +40,7 @@ async function fetchWithRetry(url, options, retries = 3, delay = 1000) {
   }
 }
 
-async function retryOperation(operation, maxRetries = 3, delayMs = 2000) {
+async function retryOperation(operation, maxRetries = 10, delayMs = 500) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await operation();
@@ -41,41 +52,48 @@ async function retryOperation(operation, maxRetries = 3, delayMs = 2000) {
   }
 }
 
+async function getDynamicPriorityFee(connection) {
+  const recentFees = await connection.getRecentPrioritizationFees();
+  const medianFee =
+    recentFees.map((f) => f.prioritizationFee).sort((a, b) => a - b)[
+      Math.floor(recentFees.length / 2)
+    ] || 0;
+  return Math.max(medianFee, 10000); // Higher minimum for speed
+}
+
 async function getTokenHolders() {
-  let allHolders = [];
-  let cursor = null;
-  let page = 1;
+  const fetchPage = async (page) => {
+    const response = await fetchWithRetry(RPC_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: `getTokenAccounts-${page}`,
+        method: "getTokenAccounts",
+        params: {
+          mint: MINT_ADDRESS.toBase58(),
+          page: page,
+          limit: 1000,
+          options: { showZeroBalance: false },
+        },
+      }),
+    });
+    const data = await response.json();
+    return data.result?.token_accounts || [];
+  };
 
-  while (true) {
-    try {
-      const response = await fetchWithRetry(RPC_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "getTokenAccounts",
-          method: "getTokenAccounts",
-          params: {
-            mint: MINT_ADDRESS.toBase58(),
-            page: page,
-            limit: 1000,
-            cursor: cursor,
-            options: { showZeroBalance: false },
-          },
-        }),
-      });
+  // Estimate pages (e.g., fetch first page to get total, then parallelize)
+  const firstPage = await fetchPage(1);
+  if (!firstPage.length) return [];
 
-      const data = await response.json();
-      if (!data.result?.token_accounts?.length) break;
-
-      allHolders = allHolders.concat(data.result.token_accounts);
-      cursor = data.result.cursor;
-      page++;
-    } catch (error) {
-      console.error("Error fetching holders:", error);
-      break;
-    }
+  const estimatedPages = Math.ceil(250 / 1000) || 1; // Replace with actual total if API provides it
+  const pagePromises = [];
+  for (let page = 2; page <= estimatedPages; page++) {
+    pagePromises.push(fetchPage(page));
   }
+
+  const allPages = [firstPage, ...(await Promise.all(pagePromises))];
+  const allHolders = allPages.flat();
 
   return allHolders.map((account) => ({
     tokenAccount: account.address,
@@ -86,15 +104,19 @@ async function getTokenHolders() {
 
 async function withdrawFees(withdrawAuthority) {
   try {
-    const destinationTokenAccount = await getOrCreateAssociatedTokenAccount(
-      connection,
-      withdrawAuthority,
-      MINT_ADDRESS,
-      withdrawAuthority.publicKey,
-      false,
-      "confirmed",
-      undefined,
-      TOKEN_2022_PROGRAM_ID
+    const startTime = Date.now();
+
+    const destinationTokenAccount = await retryOperation(() =>
+      getOrCreateAssociatedTokenAccount(
+        connection,
+        withdrawAuthority,
+        MINT_ADDRESS,
+        withdrawAuthority.publicKey,
+        false,
+        "confirmed",
+        undefined,
+        TOKEN_2022_PROGRAM_ID
+      )
     );
 
     const initialBalance = await connection.getTokenAccountBalance(
@@ -107,7 +129,7 @@ async function withdrawFees(withdrawAuthority) {
     console.log(`Found ${holders.length} token accounts from Helius API`);
     const tokenAccounts = holders.map((h) => new PublicKey(h.tokenAccount));
 
-    const BATCH_SIZE = 20;
+    const BATCH_SIZE = 25; // Increased for fewer batches
     const batches = [];
     for (let i = 0; i < tokenAccounts.length; i += BATCH_SIZE) {
       batches.push(tokenAccounts.slice(i, i + BATCH_SIZE));
@@ -117,37 +139,106 @@ async function withdrawFees(withdrawAuthority) {
       `Harvesting from ${tokenAccounts.length} token accounts in ${batches.length} batches...`
     );
     const harvestSignatures = [];
+
+    const concurrencyLimit = 1; // Increased for faster parallel processing
+    const batchPromises = [];
     for (const batch of batches) {
-      const signature = await retryOperation(
+      const harvestPromise = retryOperation(
         async () => {
-          return await harvestWithheldTokensToMint(
-            connection,
-            withdrawAuthority,
-            MINT_ADDRESS,
-            batch,
-            { commitment: "confirmed" },
-            TOKEN_2022_PROGRAM_ID
+          const tx = new Transaction();
+          const priorityFee = await getDynamicPriorityFee(connection);
+          tx.add(
+            ComputeBudgetProgram.setComputeUnitPrice({
+              microLamports: priorityFee,
+            })
           );
+          tx.add(
+            ComputeBudgetProgram.setComputeUnitLimit({
+              units: COMPUTE_UNITS,
+            })
+          );
+
+          tx.add(
+            createHarvestWithheldTokensToMintInstruction(
+              MINT_ADDRESS,
+              batch,
+              TOKEN_2022_PROGRAM_ID
+            )
+          );
+
+          const { blockhash, lastValidBlockHeight } =
+            await connection.getLatestBlockhash("confirmed");
+          tx.recentBlockhash = blockhash;
+          tx.lastValidBlockHeight = lastValidBlockHeight;
+          tx.feePayer = withdrawAuthority.publicKey;
+
+          const signature = await sendAndConfirmTransaction(
+            connection,
+            tx,
+            [withdrawAuthority],
+            {
+              commitment: "confirmed",
+              maxRetries: 20, // Aggressive retries
+              skipPreflight: false,
+              preflightCommitment: "confirmed",
+            }
+          );
+          console.log(`Harvest batch completed. Signature: ${signature}`);
+          return signature;
         },
-        3,
-        2000
-      );
-      harvestSignatures.push(signature);
-      console.log(`Harvest batch completed. Signature: ${signature}`);
+        10,
+        500
+      ); // More retries, shorter delay
+
+      batchPromises.push(harvestPromise);
+
+      if (batchPromises.length >= concurrencyLimit) {
+        harvestSignatures.push(...(await Promise.all(batchPromises)));
+        batchPromises.length = 0;
+        await new Promise((resolve) => setTimeout(resolve, 100)); // Throttle RPC load
+      }
+    }
+    if (batchPromises.length > 0) {
+      harvestSignatures.push(...(await Promise.all(batchPromises)));
     }
 
     console.log("Withdrawing withheld tokens from the mint...");
-    const withdrawSignature = await retryOperation(() =>
-      withdrawWithheldTokensFromMint(
-        connection,
-        withdrawAuthority,
+    const withdrawTx = new Transaction();
+    const withdrawPriorityFee = await getDynamicPriorityFee(connection);
+    withdrawTx.add(
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: withdrawPriorityFee,
+      })
+    );
+    withdrawTx.add(
+      ComputeBudgetProgram.setComputeUnitLimit({
+        units: COMPUTE_UNITS,
+      })
+    );
+
+    withdrawTx.add(
+      createWithdrawWithheldTokensFromMintInstruction(
         MINT_ADDRESS,
         destinationTokenAccount.address,
         withdrawAuthority.publicKey,
         [],
-        { commitment: "confirmed" },
         TOKEN_2022_PROGRAM_ID
       )
+    );
+
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash("confirmed");
+    withdrawTx.recentBlockhash = blockhash;
+    withdrawTx.lastValidBlockHeight = lastValidBlockHeight;
+    withdrawTx.feePayer = withdrawAuthority.publicKey;
+
+    const withdrawSignature = await retryOperation(() =>
+      sendAndConfirmTransaction(connection, withdrawTx, [withdrawAuthority], {
+        commitment: "confirmed",
+        maxRetries: 20,
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+      })
     );
     console.log("Withdrawal transaction signature:", withdrawSignature);
 
@@ -159,6 +250,7 @@ async function withdrawFees(withdrawAuthority) {
 
     const withdrawnAmount = finalAmount - initialAmount;
     console.log("Withdrawn amount (calculated):", withdrawnAmount);
+    console.log(`Withdraw took ${Date.now() - startTime}ms`);
 
     return withdrawnAmount;
   } catch (error) {
