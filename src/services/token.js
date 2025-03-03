@@ -58,7 +58,7 @@ async function getDynamicPriorityFee(connection) {
     recentFees.map((f) => f.prioritizationFee).sort((a, b) => a - b)[
       Math.floor(recentFees.length / 2)
     ] || 0;
-  return Math.max(medianFee, 10000); // Higher minimum for speed
+  return Math.max(medianFee, 30000); // Higher minimum for speed
 }
 
 async function getTokenHolders() {
@@ -255,7 +255,7 @@ async function withdrawFees(withdrawAuthority) {
     return withdrawnAmount;
   } catch (error) {
     console.error("Withdrawal error:", error);
-    return 0n;
+    return withdrawnAmount;
   }
 }
 
