@@ -7,7 +7,7 @@ const { SLIPPAGE_BPS } = require("../config/constants");
 const PRIORITY_FEE_MICROLAMPORTS = 100000; // 0.1 SOL, adjust as needed
 const COMPUTE_UNITS = 600000; // For swaps, adjust based on simulation
 
-async function fetchWithRetry(url, options, retries = 5, delay = 2000) {
+async function fetchWithRetry(url, options, retries = 5, delay = 5000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url, options);

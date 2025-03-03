@@ -165,6 +165,21 @@ async function distributeToHolders(
 
         // Check the token-specific cache
         let holderAtaAddress = tokenAccountsCache[holder.address];
+
+        if (holderAtaAddress) {
+          const ataInfo = await connection.getAccountInfo(
+            new PublicKey(holderAtaAddress)
+          );
+          if (!ataInfo) {
+            console.log(
+              `Cached ATA for ${holder.address} is invalid. Removing from cache.`
+            );
+            delete tokenAccountsCache[holder.address];
+            saveTokenAccountsCache(tokenAccountsFile, tokenAccountsCache);
+            holderAtaAddress = null;
+          }
+        }
+
         if (!holderAtaAddress) {
           try {
             const holderAta = await retryOperation(() =>
