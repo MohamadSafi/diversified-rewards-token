@@ -15,25 +15,24 @@ const {
 const { performJupiterSwap } = require("./swap");
 const {
   OUTPUT_MINTS,
-  TREASURY_WALLET,
   BATCH_SIZE,
   TOTAL_SUPPLY,
   MINT_ADDRESS,
-  SIDE_WALLET,
 } = require("../config/constants");
 const { ComputeBudgetProgram } = require("@solana/web3.js");
 const { TOKEN_PROGRAM_ID } = require("@solana/spl-token");
 const fs = require("fs");
 const path = require("path");
+const { getDrtPriceInUsd } = require("./price");
 
 let currentOutputIndex = 0;
-const COMPUTE_UNITS = 2000000; // Define at module level since it’s static
+const COMPUTE_UNITS = 300000; // Define at module level since it’s static
 
 async function getDynamicPriorityFee(connection) {
   const recentFees = await connection.getRecentPrioritizationFees();
 
   if (!recentFees || recentFees.length === 0) {
-    return 100_000; // Default high priority fee if no data is available (~0.05 SOL for 500k CU)
+    return 50_000; // Default high priority fee if no data is available (~0.05 SOL for 500k CU)
   }
 
   // Sort and find the median fee
@@ -42,7 +41,7 @@ async function getDynamicPriorityFee(connection) {
     .sort((a, b) => a - b)[Math.floor(recentFees.length / 2)];
 
   // Apply a multiplier for priority (e.g., 1.5x the median for faster confirmation)
-  const priorityFee = Math.max(medianFee * 2, 50_000); // At least 50k µLamports (0.025 SOL)
+  const priorityFee = Math.max(medianFee * 1.5, 50_000); // At least 50k µLamports (0.025 SOL)
 
   return priorityFee;
 }
@@ -121,6 +120,17 @@ async function distributeToHolders(
   const solBalance = await connection.getBalance(withdrawAuthority.publicKey);
   console.log(`Withdraw authority SOL balance: ${solBalance / 1e9} SOL`);
 
+  // Fetch DRT price and calculate minimum balance for $20
+  const drtPriceUsd = await getDrtPriceInUsd();
+  const DRT_DECIMALS = 9; // Adjust if your DRT token has different decimals
+  const DOLLARS_THRESHOLD = 15; // $15 threshold
+  const MINIMUM_BALANCE = BigInt(
+    Math.ceil((DOLLARS_THRESHOLD / drtPriceUsd) * 10 ** DRT_DECIMALS)
+  );
+  console.log(
+    `Minimum DRT balance for distribution: ${MINIMUM_BALANCE} lamports ($${DOLLARS_THRESHOLD})`
+  );
+
   // Add compute budget instructions
   batchTx.add(
     ComputeBudgetProgram.setComputeUnitPrice({
@@ -136,7 +146,7 @@ async function distributeToHolders(
   // Calculate shares with higher precision
   const totalSupplyBig = BigInt(TOTAL_SUPPLY);
   const amountBig = BigInt(amount);
-  let totalDistributed = 0n; // Track distributed amount to avoid exceeding input
+  let totalDistributed = 0n;
 
   for (const [index, holder] of holders.entries()) {
     console.log(
@@ -146,14 +156,31 @@ async function distributeToHolders(
       const holderPk = new PublicKey(holder.address);
       const holderBalance = BigInt(holder.amount);
 
+      // Skip non-holders or those with less than $20 worth of DRT
+      if (holderBalance === 0n) {
+        console.log(`Skipping ${holder.address} (holder balance is 0)`);
+        continue;
+      }
+      if (holderBalance <= MINIMUM_BALANCE) {
+        console.log(
+          `Skipping ${holder.address} (balance ${holderBalance} <= ${MINIMUM_BALANCE} [$${DOLLARS_THRESHOLD} threshold])`
+        );
+        continue;
+      }
+
       // Use floating-point for precision, then convert to integer lamports
       const shareFloat =
         (Number(holderBalance) * Number(amount)) / Number(totalSupplyBig);
-      let share = BigInt(Math.max(Math.floor(shareFloat), isBtc ? 1 : 0)); // Minimum 1 lamport for BTC
+      let share = BigInt(Math.floor(shareFloat));
+
+      // Apply minimum 1 lamport for BTC only if share would be 0 but holder has balance
+      if (isBtc && share === 0n && holderBalance > 0n) {
+        share = 1n;
+      }
 
       // Ensure we don’t exceed the total amount
       if (totalDistributed + share > amountBig) {
-        share = amountBig - totalDistributed; // Adjust to fit remaining amount
+        share = amountBig - totalDistributed;
       }
       if (share === 0n) {
         console.log(`Skipping ${holder.address} (adjusted share is 0)`);
@@ -304,16 +331,15 @@ async function distributeToHolders(
           console.error(`Batch failed:`, err);
           for (let i = 0; i < instructionsCount; i++) {
             const h = holders[i];
-            const hShare = BigInt(
-              Math.max(
-                Math.floor(
-                  (Number(BigInt(h.amount)) * Number(amount)) /
-                    Number(totalSupplyBig)
-                ),
-                isBtc ? 1 : 0
-              )
-            );
-            if (hShare > 0n) failedHolders.push({ holder: h, share: hShare });
+            const hShareFloat =
+              (Number(BigInt(h.amount)) * Number(amount)) /
+              Number(totalSupplyBig);
+            const hShare =
+              BigInt(Math.floor(hShareFloat)) ||
+              (isBtc && BigInt(h.amount) > 0n ? 1n : 0n);
+            if (hShare > 0n && BigInt(h.amount) > MINIMUM_BALANCE) {
+              failedHolders.push({ holder: h, share: hShare });
+            }
           }
         }
 
@@ -378,16 +404,14 @@ async function distributeToHolders(
       console.error(`Final batch failed:`, err);
       for (let i = 0; i < instructionsCount; i++) {
         const h = holders[i];
-        const hShare = BigInt(
-          Math.max(
-            Math.floor(
-              (Number(BigInt(h.amount)) * Number(amount)) /
-                Number(totalSupplyBig)
-            ),
-            isBtc ? 1 : 0
-          )
-        );
-        if (hShare > 0n) failedHolders.push({ holder: h, share: hShare });
+        const hShareFloat =
+          (Number(BigInt(h.amount)) * Number(amount)) / Number(totalSupplyBig);
+        const hShare =
+          BigInt(Math.floor(hShareFloat)) ||
+          (isBtc && BigInt(h.amount) > 0n ? 1n : 0n);
+        if (hShare > 0n && BigInt(h.amount) > MINIMUM_BALANCE) {
+          failedHolders.push({ holder: h, share: hShare });
+        }
       }
     }
   }
@@ -399,6 +423,16 @@ async function distributeToHolders(
       console.log(`Retrying ${holder.address} with share ${share}`);
       try {
         const holderPk = new PublicKey(holder.address);
+        const holderBalance = BigInt(holder.amount);
+
+        // Double-check balance in retry to ensure consistency
+        if (holderBalance <= MINIMUM_BALANCE) {
+          console.log(
+            `Skipping retry for ${holder.address} (balance ${holderBalance} <= ${MINIMUM_BALANCE} [$${DOLLARS_THRESHOLD} threshold])`
+          );
+          continue;
+        }
+
         const tx = new Transaction();
         tx.add(
           ComputeBudgetProgram.setComputeUnitPrice({
@@ -527,6 +561,7 @@ async function distributeToHolders(
     `Distribution complete. Processed: ${holders.length}, Distributed: ${totalDistributed}, Failed: ${failedHolders.length}`
   );
 }
+
 async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
   const outputMint = OUTPUT_MINTS[currentOutputIndex];
   currentOutputIndex = (currentOutputIndex + 1) % OUTPUT_MINTS.length;
@@ -535,7 +570,7 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
   const treasuryWalletPk = new PublicKey(
     "CEC28iG14pTEZ6jtKqTRp4tohKYvVKZJAgycfUq5faXg"
   );
-  const sideWalletPk = new PublicKey(
+  const devWalletPk = new PublicKey(
     "4BYJtpPXD7mxrzSBi7rkeHehBKW2TzgnAD39vEJddNpt"
   );
 
@@ -603,134 +638,112 @@ async function distributeRewards(withdrawAuthority, holders, withdrawnAmount) {
 
   const toDistribute = (tokensReceived * 80n) / 100n;
   const toTreasury = (tokensReceived * 17n) / 100n; // 17% to treasury
-  const toSideWallet = (tokensReceived * 3n) / 100n; // 3% to side wallet
+  const toDevWallet = (tokensReceived * 3n) / 100n; // 3% to dev wallet
+  // Transfer to treasury
+  console.log(
+    `Sending ${toTreasury} of mint ${outputMint} to treasury (${treasuryWalletPk.toBase58()})...`
+  );
+  const treasuryTx = new Transaction();
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash("confirmed");
+  treasuryTx.recentBlockhash = blockhash;
+  treasuryTx.lastValidBlockHeight = lastValidBlockHeight;
+  treasuryTx.feePayer = withdrawAuthority.publicKey;
 
+  if (isSolOutput) {
+    treasuryTx.add(
+      SystemProgram.transfer({
+        fromPubkey: withdrawAuthority.publicKey,
+        toPubkey: treasuryWalletPk,
+        lamports: Number(toTreasury),
+      })
+    );
+  } else {
+    const treasuryAta = await getOrCreateAssociatedTokenAccount(
+      connection,
+      withdrawAuthority,
+      outputMintPk,
+      treasuryWalletPk,
+      false,
+      "confirmed"
+    );
+    treasuryTx.add(
+      createTransferInstruction(
+        sourceAtaPubkey,
+        treasuryAta.address,
+        withdrawAuthority.publicKey,
+        Number(toTreasury),
+        [],
+        TOKEN_PROGRAM_ID
+      )
+    );
+  }
+
+  const treasurySignature = await sendAndConfirmTransaction(
+    connection,
+    treasuryTx,
+    [withdrawAuthority],
+    {
+      commitment: "confirmed",
+      maxRetries: 10,
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    }
+  );
+  console.log(`Treasury transfer completed. TX: ${treasurySignature}`);
+
+  // Transfer to dev wallet
   // console.log(
-  //   `Distributing ${toDistribute} to holders, ${toTreasury} to treasury, ${toSideWallet} to side wallet...`
+  //   `Sending ${toDevWallet} of mint ${outputMint} to dev wallet (${devWalletPk.toBase58()})...`
   // );
-
-  // // Send to Treasury Wallet
-  // const treasuryTx = new Transaction();
-  // const treasuryPriorityFee = await getDynamicPriorityFee(connection);
-  // treasuryTx.add(
-  //   ComputeBudgetProgram.setComputeUnitPrice({
-  //     microLamports: treasuryPriorityFee,
-  //   })
-  // );
-  // treasuryTx.add(
-  //   ComputeBudgetProgram.setComputeUnitLimit({
-  //     units: COMPUTE_UNITS,
-  //   })
-  // );
+  // const devWalletTx = new Transaction();
+  // devWalletTx.recentBlockhash = blockhash;
+  // devWalletTx.lastValidBlockHeight = lastValidBlockHeight;
+  // devWalletTx.feePayer = withdrawAuthority.publicKey;
 
   // if (isSolOutput) {
-  //   treasuryTx.add(
+  //   devWalletTx.add(
   //     SystemProgram.transfer({
   //       fromPubkey: withdrawAuthority.publicKey,
-  //       toPubkey: treasuryWalletPk,
-  //       lamports: Number(toTreasury),
+  //       toPubkey: devWalletPk,
+  //       lamports: Number(toDevWallet),
   //     })
   //   );
   // } else {
-  //   const treasuryAta = await retryOperation(() =>
-  //     getOrCreateAssociatedTokenAccount(
-  //       connection,
-  //       withdrawAuthority,
-  //       outputMintPk,
-  //       treasuryWalletPk,
-  //       false,
-  //       "confirmed"
-  //     )
+  //   const devWalletAta = await getOrCreateAssociatedTokenAccount(
+  //     connection,
+  //     withdrawAuthority,
+  //     outputMintPk,
+  //     devWalletPk,
+  //     false,
+  //     "confirmed"
   //   );
-  //   treasuryTx.add(
+  //   devWalletTx.add(
   //     createTransferInstruction(
   //       sourceAtaPubkey,
-  //       treasuryAta.address,
+  //       devWalletAta.address,
   //       withdrawAuthority.publicKey,
-  //       Number(toTreasury),
+  //       Number(toDevWallet),
   //       [],
   //       TOKEN_PROGRAM_ID
   //     )
   //   );
   // }
 
-  // const treasuryBlockhash = await connection.getLatestBlockhash("confirmed");
-  // treasuryTx.recentBlockhash = treasuryBlockhash.blockhash;
-  // treasuryTx.lastValidBlockHeight = treasuryBlockhash.lastValidBlockHeight;
-  // treasuryTx.feePayer = withdrawAuthority.publicKey;
-
-  // const treasurySignature = await retryOperation(() =>
-  //   sendAndConfirmTransaction(connection, treasuryTx, [withdrawAuthority], {
+  // const devWalletSignature = await sendAndConfirmTransaction(
+  //   connection,
+  //   devWalletTx,
+  //   [withdrawAuthority],
+  //   {
   //     commitment: "confirmed",
   //     maxRetries: 10,
   //     skipPreflight: false,
   //     preflightCommitment: "confirmed",
-  //   })
+  //   }
   // );
-  // console.log(
-  //   `Sent ${toTreasury} to treasury wallet. TX: ${treasurySignature}`
-  // );
+  // console.log(`Dev wallet transfer completed. TX: ${devWalletSignature}`);
 
-  // // Send to Side Wallet
-  // const sideTx = new Transaction();
-  // const sidePriorityFee = await getDynamicPriorityFee(connection);
-  // sideTx.add(
-  //   ComputeBudgetProgram.setComputeUnitPrice({
-  //     microLamports: sidePriorityFee,
-  //   })
-  // );
-  // sideTx.add(
-  //   ComputeBudgetProgram.setComputeUnitLimit({
-  //     units: COMPUTE_UNITS,
-  //   })
-  // );
-
-  // if (isSolOutput) {
-  //   sideTx.add(
-  //     SystemProgram.transfer({
-  //       fromPubkey: withdrawAuthority.publicKey,
-  //       toPubkey: sideWalletPk,
-  //       lamports: Number(toSideWallet),
-  //     })
-  //   );
-  // } else {
-  //   const sideAta = await retryOperation(() =>
-  //     getOrCreateAssociatedTokenAccount(
-  //       connection,
-  //       withdrawAuthority,
-  //       outputMintPk,
-  //       sideWalletPk,
-  //       false,
-  //       "confirmed"
-  //     )
-  //   );
-  //   sideTx.add(
-  //     createTransferInstruction(
-  //       sourceAtaPubkey,
-  //       sideAta.address,
-  //       withdrawAuthority.publicKey,
-  //       Number(toSideWallet),
-  //       [],
-  //       TOKEN_PROGRAM_ID
-  //     )
-  //   );
-  // }
-
-  // const sideBlockhash = await connection.getLatestBlockhash("confirmed");
-  // sideTx.recentBlockhash = sideBlockhash.blockhash;
-  // sideTx.lastValidBlockHeight = sideBlockhash.lastValidBlockHeight;
-  // sideTx.feePayer = withdrawAuthority.publicKey;
-
-  // const sideSignature = await retryOperation(() =>
-  //   sendAndConfirmTransaction(connection, sideTx, [withdrawAuthority], {
-  //     commitment: "confirmed",
-  //     maxRetries: 10,
-  //     skipPreflight: false,
-  //     preflightCommitment: "confirmed",
-  //   })
-  // );
-  // console.log(`Sent ${toSideWallet} to side wallet. TX: ${sideSignature}`);
-
+  // Distribute to holders
   console.log(
     `Distributing ${toDistribute} of mint ${outputMint} to holders...`
   );

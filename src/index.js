@@ -1,10 +1,13 @@
 const { getWithdrawAuthority } = require("./utils/solana");
 const { getTokenHolders, withdrawFees } = require("./services/token");
 const { distributeRewards } = require("./services/distribution");
+const { getDrtPriceInUsd } = require("./services/price");
+
 const {
   WITHDRAW_AUTHORITY_PRIVATE_KEY,
   DISTRIBUTION_INTERVAL,
 } = require("./config/constants");
+const MINIMUM_USD_VALUE = 50;
 
 process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
@@ -14,7 +17,7 @@ process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
 
-async function retryOperation(operation, maxRetries = 3, delayMs = 5000) {
+async function retryOperation(operation, maxRetries = 3, delayMs = 10000) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await operation();
@@ -39,6 +42,8 @@ async function main() {
     process.exit(1);
   }
 
+  let accumulatedAmount = 0n; // To carry over skipped amounts
+
   async function runDistribution() {
     try {
       // Step 1: Get token holders
@@ -53,6 +58,9 @@ async function main() {
 
       // Step 2: Withdraw fees
       let withdrawnAmount = 0n;
+      const drtPriceUsd = await getDrtPriceInUsd();
+      const drtDecimals = 9; // Adjust if different
+
       try {
         withdrawnAmount = await withdrawFees(withdrawAuthority);
         console.log(`Withdrawn amount: ${withdrawnAmount}`);
@@ -60,6 +68,24 @@ async function main() {
         console.error("Error withdrawing fees:", error);
       }
 
+      const withdrawnUsdValue =
+        (Number(withdrawnAmount) / 10 ** drtDecimals) * drtPriceUsd;
+      console.log(`Withdrawn amount in USD: $${withdrawnUsdValue.toFixed(2)}`);
+
+      withdrawnAmount += accumulatedAmount;
+      console.log(`Total amount including accumulated: ${withdrawnAmount}`);
+
+      if (withdrawnUsdValue < MINIMUM_USD_VALUE) {
+        console.log(
+          `Withdrawn amount ($${withdrawnUsdValue.toFixed(
+            2
+          )}) is less than $${MINIMUM_USD_VALUE}, skipping distribution and accumulating`
+        );
+        accumulatedAmount = withdrawnAmount;
+        return;
+      }
+
+      accumulatedAmount = 0n;
       // Step 3: Distribute rewards with retries
       if (withdrawnAmount > 0n) {
         await retryOperation(
