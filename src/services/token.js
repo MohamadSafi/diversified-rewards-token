@@ -8,16 +8,12 @@ const {
   createTransferInstruction,
 } = require("@solana/spl-token");
 const fetch = require("node-fetch");
-const {
-  connection,
-  PublicKey,
-  Transaction,
-  sendAndConfirmTransaction,
-} = require("../utils/solana");
-const { ComputeBudgetProgram } = require("@solana/web3.js");
+const web3 = require("@solana/web3.js");
+const ComputeBudgetProgram = web3.ComputeBudgetProgram;
+const { connection, PublicKey, Transaction } = require("../utils/solana");
 const { MINT_ADDRESS, RPC_URL } = require("../config/constants");
 
-const COMPUTE_UNITS = 50000;
+const COMPUTE_UNITS = 200000;
 
 async function fetchWithRetry(url, options, retries = 5, delay = 1000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -40,13 +36,75 @@ async function fetchWithRetry(url, options, retries = 5, delay = 1000) {
   }
 }
 
-async function retryOperation(operation, maxRetries = 10, delayMs = 500) {
+async function sendAndConfirmWithRetry(
+  tx,
+  signers,
+  maxRetries = 5,
+  delayMs = 250
+) {
+  let lastSignature = null;
+  let blockhashInfo = await connection.getLatestBlockhash("confirmed");
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await operation();
+      if (lastSignature) {
+        const status = await connection.getSignatureStatus(lastSignature, {
+          searchTransactionHistory: true,
+        });
+        if (status.value && !status.value.err) {
+          console.log(
+            `Transaction ${lastSignature} already confirmed on-chain`
+          );
+          return lastSignature;
+        }
+      }
+
+      blockhashInfo = await connection.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = blockhashInfo.blockhash;
+      tx.lastValidBlockHeight = blockhashInfo.lastValidBlockHeight;
+      tx.feePayer = signers[0].publicKey;
+
+      lastSignature = await connection.sendTransaction(tx, signers, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+        maxRetries: 2,
+      });
+
+      const confirmation = await connection.confirmTransaction(
+        {
+          signature: lastSignature,
+          blockhash: blockhashInfo.blockhash,
+          lastValidBlockHeight: blockhashInfo.lastValidBlockHeight,
+        },
+        "confirmed"
+      );
+
+      if (confirmation.value.err) {
+        throw new Error(
+          `Confirmation failed: ${JSON.stringify(confirmation.value.err)}`
+        );
+      }
+
+      console.log(`Transaction confirmed. Signature: ${lastSignature}`);
+      return lastSignature;
     } catch (error) {
       console.error(`Attempt ${attempt}/${maxRetries} failed:`, error);
-      if (attempt === maxRetries) throw error;
+      lastSignature = error.signature || lastSignature;
+      if (attempt === maxRetries) {
+        console.error("Max retries reached, checking final status...");
+        if (lastSignature) {
+          const status = await connection.getSignatureStatus(lastSignature, {
+            searchTransactionHistory: true,
+          });
+          if (status.value && !status.value.err) {
+            console.log(
+              `Transaction ${lastSignature} confirmed despite retries`
+            );
+            return lastSignature;
+          }
+        }
+        throw error;
+      }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
@@ -90,15 +148,8 @@ async function getTokenHolders() {
     console.log(`Fetching page ${page} of token holders...`);
     const pageHolders = await fetchPage(page);
     allHolders.push(...pageHolders);
-
-    // If fewer than limit, we've reached the last page
-    if (pageHolders.length < 1000) {
-      hasMore = false;
-    } else {
-      page++;
-    }
-
-    // Optional: Add a small delay to avoid rate limiting
+    if (pageHolders.length < 1000) hasMore = false;
+    else page++;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
@@ -108,7 +159,6 @@ async function getTokenHolders() {
   }
 
   console.log(`Fetched ${allHolders.length} token holders in total.`);
-
   return allHolders.map((account) => ({
     tokenAccount: account.address,
     address: account.owner,
@@ -119,18 +169,15 @@ async function getTokenHolders() {
 async function withdrawFees(withdrawAuthority) {
   const startTime = Date.now();
 
-  // Create destination token account
-  const destinationTokenAccount = await retryOperation(() =>
-    getOrCreateAssociatedTokenAccount(
-      connection,
-      withdrawAuthority,
-      MINT_ADDRESS,
-      withdrawAuthority.publicKey,
-      false,
-      "confirmed",
-      undefined,
-      TOKEN_2022_PROGRAM_ID
-    )
+  const destinationTokenAccount = await getOrCreateAssociatedTokenAccount(
+    connection,
+    withdrawAuthority,
+    MINT_ADDRESS,
+    withdrawAuthority.publicKey,
+    false,
+    "confirmed",
+    undefined,
+    TOKEN_2022_PROGRAM_ID
   );
 
   const initialBalance = await connection.getTokenAccountBalance(
@@ -154,93 +201,55 @@ async function withdrawFees(withdrawAuthority) {
   );
   const harvestSignatures = [];
 
-  // Process batches sequentially with retries
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    console.log(
-      `Processing batch ${i + 1}/${batches.length} with ${
-        batch.length
-      } accounts...`
+  // Parallel harvest with full confirmation
+  const harvestPromises = batches.map(async (batch, i) => {
+    const tx = new Transaction();
+    const priorityFee = await getDynamicPriorityFee(connection);
+    tx.add(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
+    );
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNITS }));
+    tx.add(
+      createHarvestWithheldTokensToMintInstruction(
+        MINT_ADDRESS,
+        batch,
+        TOKEN_2022_PROGRAM_ID
+      )
     );
 
-    const signature = await retryOperation(
-      async () => {
-        const tx = new Transaction();
-        const priorityFee = await getDynamicPriorityFee(connection);
-        tx.add(
-          ComputeBudgetProgram.setComputeUnitPrice({
-            microLamports: priorityFee,
-          })
-        );
-        tx.add(
-          ComputeBudgetProgram.setComputeUnitLimit({
-            units: COMPUTE_UNITS,
-          })
-        );
-
-        tx.add(
-          createHarvestWithheldTokensToMintInstruction(
-            MINT_ADDRESS,
-            batch,
-            TOKEN_2022_PROGRAM_ID
-          )
-        );
-
-        const { blockhash, lastValidBlockHeight } =
-          await connection.getLatestBlockhash("confirmed");
-        tx.recentBlockhash = blockhash;
-        tx.lastValidBlockHeight = lastValidBlockHeight;
-        tx.feePayer = withdrawAuthority.publicKey;
-
-        const signature = await sendAndConfirmTransaction(
-          connection,
-          tx,
-          [withdrawAuthority],
-          {
-            commitment: "confirmed",
-            maxRetries: 10,
-            skipPreflight: false,
-            preflightCommitment: "confirmed",
-          }
-        );
-        console.log(
-          `Harvest batch ${i + 1} completed. Signature: ${signature}`
-        );
-        return signature;
-      },
-      10,
-      500 // 10 retries, 500ms delay
-    );
-
-    if (!signature) {
-      throw new Error(
-        `Harvest batch ${i + 1} failed after retries, aborting withdrawal`
-      );
+    const signature = await sendAndConfirmWithRetry(tx, [withdrawAuthority]);
+    if (signature) {
+      harvestSignatures.push(signature);
+      console.log(`Harvest batch ${i + 1} completed. Signature: ${signature}`);
+    } else {
+      console.error(`Harvest batch ${i + 1} failed`);
     }
-    harvestSignatures.push(signature);
-    await new Promise((resolve) => setTimeout(resolve, 100)); // Throttle RPC load
-  }
+    return signature;
+  });
 
-  // Only proceed if all batches succeeded
+  // Wait for all harvests to confirm
+  const results = await Promise.all(harvestPromises);
   console.log(
-    `All ${batches.length} harvest batches completed successfully. Signatures:`,
+    `All ${batches.length} harvest batches processed. Signatures:`,
     harvestSignatures
   );
 
+  // Check for failed batches
+  if (harvestSignatures.length !== batches.length) {
+    console.warn(
+      `Only ${harvestSignatures.length}/${batches.length} batches succeeded`
+    );
+  }
+
   console.log("Withdrawing withheld tokens from the mint...");
   const withdrawTx = new Transaction();
-  const withdrawPriorityFee = await getDynamicPriorityFee(connection);
+  const priorityFee = await getDynamicPriorityFee(connection);
   withdrawTx.add(
-    ComputeBudgetProgram.setComputeUnitPrice({
-      microLamports: withdrawPriorityFee,
-    })
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
   );
   withdrawTx.add(
-    ComputeBudgetProgram.setComputeUnitLimit({
-      units: COMPUTE_UNITS,
-    })
+    ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNITS })
   );
-
   withdrawTx.add(
     createWithdrawWithheldTokensFromMintInstruction(
       MINT_ADDRESS,
@@ -251,20 +260,9 @@ async function withdrawFees(withdrawAuthority) {
     )
   );
 
-  const { blockhash, lastValidBlockHeight } =
-    await connection.getLatestBlockhash("confirmed");
-  withdrawTx.recentBlockhash = blockhash;
-  withdrawTx.lastValidBlockHeight = lastValidBlockHeight;
-  withdrawTx.feePayer = withdrawAuthority.publicKey;
-
-  const withdrawSignature = await retryOperation(() =>
-    sendAndConfirmTransaction(connection, withdrawTx, [withdrawAuthority], {
-      commitment: "confirmed",
-      maxRetries: 20,
-      skipPreflight: false,
-      preflightCommitment: "confirmed",
-    })
-  );
+  const withdrawSignature = await sendAndConfirmWithRetry(withdrawTx, [
+    withdrawAuthority,
+  ]);
   console.log("Withdrawal transaction signature:", withdrawSignature);
 
   const finalBalance = await connection.getTokenAccountBalance(
@@ -303,4 +301,6 @@ module.exports = {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   createTransferInstruction,
+  sendAndConfirmWithRetry, // Export for use elsewhere
 };
+

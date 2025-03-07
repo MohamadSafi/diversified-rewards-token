@@ -4,10 +4,11 @@ const { connection } = require("../utils/solana");
 const { SLIPPAGE_BPS } = require("../config/constants");
 
 // Priority fee settings
-const PRIORITY_FEE_MICROLAMPORTS = 100000; // 0.1 SOL, adjust as needed
-const COMPUTE_UNITS = 600000; // For swaps, adjust based on simulation
+const PRIORITY_FEE_MICROLAMPORTS = 100000; // 0.1 SOL
+const COMPUTE_UNITS = 600000; // For swaps
 
-async function fetchWithRetry(url, options, retries = 5, delay = 50000) {
+async function fetchWithRetry(url, options, retries = 5, delay = 5000) {
+  // Reduced delay from 50s to 5s for faster retries
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url, options);
@@ -24,6 +25,84 @@ async function fetchWithRetry(url, options, retries = 5, delay = 50000) {
         `Fetch attempt ${attempt}/${retries} failed: ${error.message}. Retrying in ${delay}ms...`
       );
       await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+async function sendAndConfirmVersionedTxWithRetry(
+  tx,
+  signers,
+  maxRetries = 5,
+  delayMs = 250
+) {
+  let lastSignature = null;
+  let blockhashInfo = await connection.getLatestBlockhash("confirmed");
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Check if the last signature is already confirmed
+      if (lastSignature) {
+        const status = await connection.getSignatureStatus(lastSignature, {
+          searchTransactionHistory: true,
+        });
+        if (status.value && !status.value.err) {
+          console.log(
+            `Transaction ${lastSignature} already confirmed on-chain`
+          );
+          return lastSignature;
+        }
+      }
+
+      // Update blockhash and sign
+      blockhashInfo = await connection.getLatestBlockhash("confirmed");
+      tx.message.recentBlockhash = blockhashInfo.blockhash;
+      tx.sign(signers);
+
+      // Send the transaction
+      lastSignature = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+        maxRetries: 2, // Initial retries within send
+      });
+
+      // Confirm the transaction
+      const confirmation = await connection.confirmTransaction(
+        {
+          signature: lastSignature,
+          blockhash: blockhashInfo.blockhash,
+          lastValidBlockHeight: blockhashInfo.lastValidBlockHeight,
+        },
+        "confirmed"
+      );
+
+      if (confirmation.value.err) {
+        throw new Error(
+          `Confirmation failed: ${JSON.stringify(confirmation.value.err)}`
+        );
+      }
+
+      console.log(`Transaction confirmed. Signature: ${lastSignature}`);
+      return lastSignature;
+    } catch (error) {
+      console.error(`Attempt ${attempt}/${maxRetries} failed:`, error);
+      lastSignature =
+        error.signature || lastSignature || tx.signatures[0]?.toString(); // Fallback to tx signature if available
+      if (attempt === maxRetries) {
+        console.error("Max retries reached, checking final status...");
+        if (lastSignature) {
+          const status = await connection.getSignatureStatus(lastSignature, {
+            searchTransactionHistory: true,
+          });
+          if (status.value && !status.value.err) {
+            console.log(
+              `Transaction ${lastSignature} confirmed despite retries`
+            );
+            return lastSignature; // Success if confirmed on-chain
+          }
+        }
+        throw error; // Final failure if still unconfirmed
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
 }
@@ -63,8 +142,8 @@ async function performJupiterSwap(
           quoteResponse: quoteData,
           userPublicKey: withdrawAuthority.publicKey.toBase58(),
           wrapAndUnwrapSol: isSolOutput,
-          computeUnitPriceMicroLamports: PRIORITY_FEE_MICROLAMPORTS, // Priority fee
-          computeUnitLimit: COMPUTE_UNITS, // Compute budget
+          computeUnitPriceMicroLamports: PRIORITY_FEE_MICROLAMPORTS,
+          computeUnitLimit: COMPUTE_UNITS,
         }),
       }
     );
@@ -80,13 +159,7 @@ async function performJupiterSwap(
   const swapTransactionBuf = Buffer.from(swapData.swapTransaction, "base64");
   const swapTransaction = VersionedTransaction.deserialize(swapTransactionBuf);
 
-  // Step 4: Update blockhash and sign (no manual instruction modification)
-  const { blockhash, lastValidBlockHeight } =
-    await connection.getLatestBlockhash("confirmed");
-  swapTransaction.message.recentBlockhash = blockhash; // Update blockhash
-  swapTransaction.sign([withdrawAuthority]); // Sign with the updated blockhash
-
-  // Step 5: Simulate transaction (optional, for debugging)
+  // Step 4: Simulate transaction (optional, for debugging)
   const simulation = await connection.simulateTransaction(swapTransaction);
   if (simulation.value.err) {
     throw new Error(
@@ -97,38 +170,14 @@ async function performJupiterSwap(
     `Swap simulation: ${simulation.value.unitsConsumed} compute units used`
   );
 
-  // Step 6: Send and confirm transaction
-  const swapSignature = await connection.sendRawTransaction(
-    swapTransaction.serialize(),
-    {
-      skipPreflight: false,
-      maxRetries: 10,
-      preflightCommitment: "confirmed",
-    }
+  // Step 5: Send and confirm with retry logic
+  const swapSignature = await sendAndConfirmVersionedTxWithRetry(
+    swapTransaction,
+    [withdrawAuthority]
   );
-
-  try {
-    const confirmation = await connection.confirmTransaction(
-      {
-        signature: swapSignature,
-        blockhash,
-        lastValidBlockHeight,
-      },
-      "confirmed",
-      { maxRetries: 10 }
-    );
-
-    if (confirmation.value.err) {
-      throw new Error(
-        `Confirmation failed: ${JSON.stringify(confirmation.value.err)}`
-      );
-    }
-
-    console.log(`Swap completed. TX: ${swapSignature}`);
-    return swapSignature;
-  } catch (error) {
-    throw new Error(`Swap confirmation failed: ${error.message}`);
-  }
+  console.log(`Swap completed. TX: ${swapSignature}`);
+  return swapSignature;
 }
 
-module.exports = { performJupiterSwap };
+module.exports = { performJupiterSwap, sendAndConfirmVersionedTxWithRetry }; // Export for reuse
+

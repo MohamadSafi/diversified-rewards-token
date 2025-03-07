@@ -15,5 +15,5 @@ module.exports = {
   BATCH_SIZE: 19,
   SLIPPAGE_BPS: 2000, // 20% slippage
   TOTAL_SUPPLY: 1_000_000_000n * 10n ** BigInt(9),
-  DISTRIBUTION_INTERVAL: 300 * 1000, // 3 minutes
+  DISTRIBUTION_INTERVAL: 360 * 1000, // 3 minutes
 };

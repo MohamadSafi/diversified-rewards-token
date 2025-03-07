@@ -7,7 +7,7 @@ const {
   WITHDRAW_AUTHORITY_PRIVATE_KEY,
   DISTRIBUTION_INTERVAL,
 } = require("./config/constants");
-const MINIMUM_USD_VALUE = 50;
+const MINIMUM_USD_VALUE = 20;
 
 process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
@@ -25,7 +25,7 @@ async function retryOperation(operation, maxRetries = 3, delayMs = 10000) {
       console.error(`Attempt ${attempt}/${maxRetries} failed:`, error);
       if (attempt === maxRetries) {
         console.error("Max retries reached, proceeding without success");
-        return null; // or throw error if you want to handle it differently
+        return null;
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -42,7 +42,7 @@ async function main() {
     process.exit(1);
   }
 
-  let accumulatedAmount = 0n; // To carry over skipped amounts
+  let accumulatedAmount = 0n; // Persistent across runs
 
   async function runDistribution() {
     try {
@@ -58,53 +58,68 @@ async function main() {
 
       // Step 2: Withdraw fees
       let withdrawnAmount = 0n;
-      const drtPriceUsd = await getDrtPriceInUsd();
+      let drtPriceUsd;
       const drtDecimals = 9; // Adjust if different
+
+      try {
+        drtPriceUsd = await getDrtPriceInUsd();
+      } catch (error) {
+        console.error(
+          "Error fetching DRT price, using last known or default:",
+          error
+        );
+        drtPriceUsd = 0.0004; // Fallback price, adjust or persist from last success
+      }
 
       try {
         withdrawnAmount = await withdrawFees(withdrawAuthority);
         console.log(`Withdrawn amount: ${withdrawnAmount}`);
       } catch (error) {
         console.error("Error withdrawing fees:", error);
+        // Preserve accumulatedAmount if no new withdrawal
       }
 
-      const withdrawnUsdValue =
-        (Number(withdrawnAmount) / 10 ** drtDecimals) * drtPriceUsd;
-      console.log(`Withdrawn amount in USD: $${withdrawnUsdValue.toFixed(2)}`);
+      const totalAmount = withdrawnAmount + accumulatedAmount;
+      const totalUsdValue =
+        (Number(totalAmount) / 10 ** drtDecimals) * drtPriceUsd;
+      console.log(`Total amount including accumulated: ${totalAmount}`);
+      console.log(`Total USD value: $${totalUsdValue.toFixed(2)}`);
 
-      withdrawnAmount += accumulatedAmount;
-      console.log(`Total amount including accumulated: ${withdrawnAmount}`);
-
-      if (withdrawnUsdValue < MINIMUM_USD_VALUE) {
+      if (totalUsdValue < MINIMUM_USD_VALUE) {
         console.log(
-          `Withdrawn amount ($${withdrawnUsdValue.toFixed(
+          `Total amount ($${totalUsdValue.toFixed(
             2
           )}) is less than $${MINIMUM_USD_VALUE}, skipping distribution and accumulating`
         );
-        accumulatedAmount = withdrawnAmount;
+        accumulatedAmount = totalAmount; // Accumulate total
         return;
       }
 
-      accumulatedAmount = 0n;
       // Step 3: Distribute rewards with retries
-      if (withdrawnAmount > 0n) {
-        await retryOperation(
+      if (totalAmount > 0n) {
+        const success = await retryOperation(
           async () => {
-            await distributeRewards(
-              withdrawAuthority,
-              holders,
-              withdrawnAmount
-            );
+            await distributeRewards(withdrawAuthority, holders, totalAmount);
             console.log("Distribution completed successfully!");
           },
           3,
           5000
-        ); // Retry 3 times, 5s delay between attempts
+        );
+
+        if (success) {
+          accumulatedAmount = 0n; // Reset only on success
+        } else {
+          console.log(
+            "Distribution failed after retries, preserving accumulated amount"
+          );
+          accumulatedAmount = 0n;
+        }
       } else {
         console.log("No fees to distribute");
       }
     } catch (error) {
       console.error("Unexpected error in runDistribution:", error);
+      // accumulatedAmount persists unchanged
     }
   }
 
@@ -134,3 +149,4 @@ async function main() {
     console.error("Main function failed:", error);
   }
 })();
+
